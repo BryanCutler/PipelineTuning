@@ -29,7 +29,27 @@ from pyspark.ml.param.shared import HasParallelism
 from pyspark.ml.tuning import CrossValidator, CrossValidatorModel, ParamGridBuilder
 from pyspark.sql.functions import rand
 
-__all__ = ['DagCrossValidator']
+__all__ = ['DagCrossValidator', 'DagPipeline']
+
+
+def get_input_map():
+    return {
+        "inputCol": lambda params: None if not params.isSet("inputCol") else params.getInputCol(),
+        "inputCols": lambda params: None if not params.isSet("inputCols") else params.getInputCols(),
+        "featuresCol": lambda params: params.getFeaturesCol(),
+        "labelCol": lambda params: params.getLabelCol(),
+        "weightCol": lambda params: None if not params.isSet("weightCol") else params.getWeightCol(),
+    }
+
+def get_output_map():
+    return {
+        "outputCol": lambda params: None if params.hasParam("outputCols") and params.isSet("outputCols") else params.getOutputCol(),
+        "outputCols": lambda params: None if not params.isSet("outputCols") else params.getOutputCols(),
+        "predictionCol": lambda params: params.getPredictionCol(),
+        "probabilityCol": lambda params: params.getProbabilityCol(),
+        "rawPredictionCol": lambda params: params.getRawPredictionCol(),
+        "varianceCol": lambda params: None if not params.isSet("varianceCol") else params.getVarianceCol(),
+    }
 
 
 class BFSTree(object):
@@ -231,12 +251,18 @@ class IterableQueue(Queue.Queue):
 
 class DagPipeline(Pipeline, HasParallelism):
 
-    def __init__(self, stages, parallelism, tree_type="dfs"):
+    def __init__(self, stages, parallelism, tree_type="dfs", addl_inputs=None, addl_outputs=None):
         super(DagPipeline, self).__init__(stages=stages)
         self.setParallelism(parallelism)
         self.roots = None
         self.nodes = None
         self.tree_type = tree_type
+        self.input_map = get_input_map()
+        self.output_map = get_output_map()
+        if addl_inputs is not None:
+            self.input_map.update(addl_inputs)
+        if addl_outputs is not None:
+            self.output_map.update(addl_outputs)
 
     def evaluate(self, paramMaps, train, validation, eval):
         num_models = len(paramMaps)
@@ -308,17 +334,6 @@ class DagPipeline(Pipeline, HasParallelism):
         # Type of tree search to execute dag
         tree = BFSTree if self.tree_type.lower() == "bfs" else DFSTree
 
-        # maps to lookup param values for inputs/outputs
-        input_lookups = [
-            ("inputCol", lambda params: params.getInputCol()),
-            ("featuresCol", lambda params: params.getFeaturesCol()),
-            ("labelCol", lambda params: params.getLabelCol())
-        ]
-        output_lookups = [
-            ("outputCol", lambda params: params.getOutputCol()),
-            ("predictionCol", lambda params: params.getPredictionCol())
-        ]
-
         stages = self.getStages()
 
         # Locate the last estimator, will not transform training data after fit
@@ -348,12 +363,23 @@ class DagPipeline(Pipeline, HasParallelism):
                     if k.parent == stage.uid:
                         temp_map.setdefault(k, set()).add(v)
 
+            def flatten_list(l):
+                result = []
+                for i in l:
+                    if isinstance(i, list):
+                        for j in i:
+                            result.append(j)
+                    else:
+                        result.append(i)
+                return result
+
             # Get the inputs/outputs for the stage
-            stage_inputs = [lookup[1](stage) for lookup in input_lookups
-                            if stage.hasParam(lookup[0])]
-            for lookup in output_lookups:
-                if stage.hasParam(lookup[0]):
-                    output_to_stage[lookup[1](stage)] = stage
+            stage_inputs = flatten_list([f(stage) for name, f in self.input_map.iteritems()
+                                         if f is not None and stage.hasParam(name)])
+            stage_outputs = flatten_list([f(stage) for name, f in self.output_map.iteritems()
+                                          if f is not None and stage.hasParam(name)])
+            for output_col in stage_outputs:
+                output_to_stage[output_col] = stage
 
             # Check if have a param grid for this stage
             if temp_map:
@@ -399,7 +425,7 @@ class DagPipeline(Pipeline, HasParallelism):
                 raise RuntimeError("Must pass in Nodes or evaluate pipeline first")
 
             g = nx.DiGraph()
-            for node in self.nodes:
+            for node in nodes:
                 for parent in node.parents:
                     g.add_edge(parent, node)
 
@@ -417,20 +443,16 @@ class DagCrossValidator(CrossValidator):
     def _fit(self, dataset):
         current_estimator = self.getEstimator()
 
-        #bestModel = super(DagCrossValidator, self)._fit(dataset)
-        #print(bestModel.avgMetrics)
-        #return bestModel
-
         # Not a Pipeline, use standard CrossValidator
         if not isinstance(current_estimator, Pipeline):
             return super(DagCrossValidator, self)._fit(dataset)
-
         # Delegate parallelism to DagPipeline
-        dag_pipeline = DagPipeline(stages=current_estimator.getStages(),
-                                   parallelism=self.getParallelism())
-        #self.setEstimator(dag_pipeline)
-        #self.setParallelism(1)
-        #model = super(DagCrossValidator, self)._fit(dataset)
+        elif not isinstance(current_estimator, DagPipeline):
+            dag_pipeline = DagPipeline(stages=current_estimator.getStages(),
+                                       parallelism=self.getParallelism())
+        # Already a DagPipeline
+        else:
+            dag_pipeline = current_estimator
 
         epm = self.getOrDefault(self.estimatorParamMaps)
         numModels = len(epm)
@@ -463,8 +485,5 @@ class DagCrossValidator(CrossValidator):
             bestIndex = np.argmin(metrics)
 
         bestModel = current_estimator.fit(dataset, epm[bestIndex])
-
-        #self.setParallelism(dag_pipeline.getParallelism())
-        #self.setEstimator(current_estimator)
 
         return self._copyValues(CrossValidatorModel(bestModel, metrics))
