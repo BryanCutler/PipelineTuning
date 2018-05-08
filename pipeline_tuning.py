@@ -19,6 +19,7 @@ import copy
 from functools import partial
 from itertools import product
 from multiprocessing.pool import ThreadPool
+from threading import Lock
 import Queue
 import time
 import numpy as np
@@ -32,6 +33,7 @@ from pyspark.sql.functions import rand
 __all__ = ['DagCrossValidator', 'DagPipeline']
 
 
+# Map the input param name to function to retrieve it
 def get_input_map():
     return {
         "inputCol": lambda params: None if not params.isSet("inputCol") else params.getInputCol(),
@@ -41,6 +43,8 @@ def get_input_map():
         "weightCol": lambda params: None if not params.isSet("weightCol") else params.getWeightCol(),
     }
 
+
+# Map the output param name to function to retrieve it
 def get_output_map():
     return {
         "outputCol": lambda params: None if params.hasParam("outputCols") and params.isSet("outputCols") else params.getOutputCol(),
@@ -52,33 +56,64 @@ def get_output_map():
     }
 
 
+class PipelineTreeNode(object):
+
+    def __init__(self, stage, stage_inputs, param_map, tree_type):
+        self.parents = []
+        self.children = []
+        self.stage = stage
+        self.stage_inputs = stage_inputs
+        self.param_map = param_map
+        self.transformer = None
+        self.lock = None
+        self.cached_count = 0
+        self.tree_type = tree_type
+
+    def __repr__(self):
+        param_map_str = str({p.name: v for p, v in self.param_map.iteritems()})
+        parent_map_str = str([{p.name: v for p, v in parent.param_map.iteritems()}
+                              for parent in self.parents])
+        return self.stage.uid + param_map_str + parent_map_str
+
+    def cache_task(self, task, dataset):
+        if not dataset.is_cached:
+            dataset.cache()
+        result = task(dataset)
+        with self.lock:
+            self.cached_count -= 1
+            if self.cached_count == 0:
+                dataset.unpersist()
+        return result
+
+    def init_is_caching(self):
+        is_caching = len(self.children) > 0 and \
+                     isinstance(self.children[0], self.tree_type.EstimatorNode) and \
+                     not isinstance(self.children[0], self.tree_type.FeatureExtractionEstimatorNode)
+        if is_caching:
+            if self.lock is None:
+                self.lock = Lock()
+            with self.lock:
+                self.cached_count = len(self.children)
+        return is_caching
+
+    def get_cache_task(self, task):
+        return partial(self.cache_task, task)
+
+
 class BFSTree(object):
 
-    class TransformerNode(object):
+    class TransformerNode(PipelineTreeNode):
 
         def __init__(self, stage, stage_inputs, param_map):
-            self.parents = []
-            self.children = []
-            self.stage = stage
-            self.stage_inputs = stage_inputs
-            self.param_map = param_map
-            self.transformer = None
-
-        def __repr__(self):
-            param_map_str = str({p.name: v for p, v in self.param_map.iteritems()})
-            parent_map_str = str([{p.name: v for p, v in parent.param_map.iteritems()}
-                                  for parent in self.parents])
-            return self.stage.uid + param_map_str + parent_map_str
-
-        def copy_with_parent_params(self, param_map):
-            node = copy.copy(self)
-            node.parent_param_map.update(param_map)
-            return node
+            super(BFSTree.TransformerNode, self).__init__(stage, stage_inputs, param_map, BFSTree)
 
         def transform_task(self, queue, results, dataset):
             transformed_dataset = self.transformer.transform(dataset)
+            is_caching = self.init_is_caching()
             for child in self.children:
                 task = child.get_fit_task(queue, results)
+                if is_caching:
+                    task = self.get_cache_task(task)
                 queue.put(partial(task, transformed_dataset))
 
         def evaluate_task(self, queue, eval, results, dataset):
@@ -103,20 +138,11 @@ class BFSTree(object):
     class EstimatorNode(TransformerNode):
 
         def fit_task(self, queue, results, dataset):
-            if not dataset.is_cached:
-                dataset.cache()
             self.transformer = self.stage.fit(dataset, params=self.param_map)
-            if self.children:
-                raise NotImplementedError("Estimator children")
-            else:
-                results.put(self)
-                if results.full():
-                    queue.stop()
-
-        def evaluate_task(self, queue, eval, results, dataset):
-            if not dataset.is_cached:
-                dataset.cache()
-            super(BFSTree.EstimatorNode, self).evaluate_task(queue, eval, results, dataset)
+            # The last estimator could only have children that transform, not fit
+            results.put(self)
+            if results.full():
+                queue.stop()
 
         def get_fit_task(self, queue, results):
             return partial(self.fit_task, queue, results)
@@ -127,11 +153,16 @@ class BFSTree(object):
             self.transformer = self.stage.fit(dataset, params=self.param_map)
             transformed_dataset = self.transformer.transform(dataset)
             if self.children:
+                is_caching = self.init_is_caching()
                 for child in self.children:
                     task = child.get_fit_task(queue, results)
+                    if is_caching:
+                        task = self.get_cache_task(task)
                     queue.put(partial(task, transformed_dataset))
             else:
-                raise NotImplementedError("feature ext no children")
+                results.put(self)
+                if results.full():
+                    queue.stop()
 
         def get_fit_task(self, queue, results):
             return partial(self.fit_task, queue, results)
@@ -139,26 +170,10 @@ class BFSTree(object):
 
 class DFSTree(object):
 
-    class TransformerNode(object):
+    class TransformerNode(PipelineTreeNode):
 
         def __init__(self, stage, stage_inputs, param_map):
-            self.parents = []
-            self.children = []
-            self.stage = stage
-            self.stage_inputs = stage_inputs
-            self.param_map = param_map
-            self.transformer = None
-
-        def __repr__(self):
-            param_map_str = str({p.name: v for p, v in self.param_map.iteritems()})
-            parent_map_str = str([{p.name: v for p, v in parent.param_map.iteritems()}
-                                  for parent in self.parents])
-            return self.stage.uid + param_map_str + parent_map_str
-
-        def copy_with_parent_params(self, param_map):
-            node = copy.copy(self)
-            node.parent_param_map.update(param_map)
-            return node
+            super(DFSTree.TransformerNode, self).__init__(stage, stage_inputs, param_map, DFSTree)
 
         def transform_task(self, queue, results, task_stack, dataset):
             transformed_dataset = self.transformer.transform(dataset)
@@ -175,11 +190,12 @@ class DFSTree(object):
         def evaluate_task(self, queue, eval, results, task_stack, dataset):
             transformed_dataset = self.transformer.transform(dataset)
             if self.children:
+                is_caching = self.init_is_caching()
                 for i, child in enumerate(self.children):
                     task = child.get_evaluate_task(queue, eval, results, task_stack)
+                    if is_caching:
+                        task = self.get_cache_task(task)
                     if i == 0 or not child.children:
-                        if not child.children and not transformed_dataset.is_cached:
-                            transformed_dataset.cache()
                         queue.put(partial(task, transformed_dataset))
                     else:
                         task_stack.insert(0, partial(task, transformed_dataset))
@@ -202,14 +218,12 @@ class DFSTree(object):
 
         def fit_task(self, queue, results, task_stack, dataset):
             self.transformer = self.stage.fit(dataset, params=self.param_map)
-            if self.children:
-                raise NotImplementedError("Estimator children")
-            else:
-                if task_stack:
-                    queue.put(task_stack.pop(0))
-                results.put(self)
-                if results.full():
-                    queue.stop()
+            # The last estimator could only have children that transform, not fit
+            if task_stack:
+                queue.put(task_stack.pop(0))
+            results.put(self)
+            if results.full():
+                queue.stop()
 
         def get_fit_task(self, queue, results, task_stack=[]):
             return partial(self.fit_task, queue, results, task_stack)
@@ -220,16 +234,19 @@ class DFSTree(object):
             self.transformer = self.stage.fit(dataset, params=self.param_map)
             transformed_dataset = self.transformer.transform(dataset)
             if self.children:
+                is_caching = self.init_is_caching()
                 for i, child in enumerate(self.children):
                     task = child.get_fit_task(queue, results, task_stack)
+                    if is_caching:
+                        task = self.get_cache_task(task)
                     if i == 0 or not child.children:
-                        if not child.children and not transformed_dataset.is_cached:
-                            transformed_dataset.cache()
                         queue.put(partial(task, transformed_dataset))
                     else:
                         task_stack.insert(0, partial(task, transformed_dataset))
             else:
-                raise NotImplementedError("feature ext no children")
+                results.put(self)
+                if results.full():
+                    queue.stop()
 
         def get_fit_task(self, queue, results, task_stack=[]):
             return partial(self.fit_task, queue, results, task_stack)
@@ -251,7 +268,7 @@ class IterableQueue(Queue.Queue):
 
 class DagPipeline(Pipeline, HasParallelism):
 
-    def __init__(self, stages, parallelism, tree_type="dfs", addl_inputs=None, addl_outputs=None):
+    def __init__(self, stages, parallelism, tree_type="bfs", addl_inputs=None, addl_outputs=None):
         super(DagPipeline, self).__init__(stages=stages)
         self.setParallelism(parallelism)
         self.roots = None
