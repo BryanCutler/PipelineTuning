@@ -78,12 +78,11 @@ class PipelineTreeNode(object):
     def cache_task(self, task, dataset):
         if not dataset.is_cached:
             dataset.cache()
-        result = task(dataset)
+        task(dataset)
         with self.lock:
             self.cached_count -= 1
             if self.cached_count == 0:
                 dataset.unpersist()
-        return result
 
     def init_is_caching(self):
         is_caching = len(self.children) > 0 and \
@@ -119,8 +118,11 @@ class BFSTree(object):
         def evaluate_task(self, queue, eval, results, dataset):
             transformed_dataset = self.transformer.transform(dataset)
             if self.children:
+                is_caching = self.init_is_caching()
                 for child in self.children:
                     task = child.get_evaluate_task(queue, eval, results)
+                    if is_caching:
+                        task = self.get_cache_task(task)
                     queue.put(partial(task, transformed_dataset))
             else:
                 metric = eval.evaluate(transformed_dataset)
@@ -175,81 +177,84 @@ class DFSTree(object):
         def __init__(self, stage, stage_inputs, param_map):
             super(DFSTree.TransformerNode, self).__init__(stage, stage_inputs, param_map, DFSTree)
 
-        def transform_task(self, queue, results, task_stack, dataset):
-            transformed_dataset = self.transformer.transform(dataset)
-            if self.children:
-                for i, child in enumerate(self.children):
-                    task = child.get_fit_task(queue, results, task_stack)
-                    if i == 0 or not child.children:
-                        queue.put(partial(task, transformed_dataset))
-                    else:
-                        task_stack.insert(0, partial(task, transformed_dataset))
-            elif task_stack:
-                queue.put(task_stack.pop(0))
-
-        def evaluate_task(self, queue, eval, results, task_stack, dataset):
+        def transform_task(self, queue, results, holding, dataset):
             transformed_dataset = self.transformer.transform(dataset)
             if self.children:
                 is_caching = self.init_is_caching()
                 for i, child in enumerate(self.children):
-                    task = child.get_evaluate_task(queue, eval, results, task_stack)
+                    task = child.get_fit_task(queue, results, holding)
                     if is_caching:
                         task = self.get_cache_task(task)
                     if i == 0 or not child.children:
                         queue.put(partial(task, transformed_dataset))
                     else:
-                        task_stack.insert(0, partial(task, transformed_dataset))
+                        holding.put(partial(task, transformed_dataset))
+            elif not holding.empty():
+                queue.put(holding.get())
+
+        def evaluate_task(self, queue, eval, results, holding, dataset):
+            transformed_dataset = self.transformer.transform(dataset)
+            if self.children:
+                is_caching = self.init_is_caching()
+                for i, child in enumerate(self.children):
+                    task = child.get_evaluate_task(queue, eval, results, holding)
+                    if is_caching:
+                        task = self.get_cache_task(task)
+                    if i == 0 or not child.children:
+                        queue.put(partial(task, transformed_dataset))
+                    else:
+                        holding.put(partial(task, transformed_dataset))
             else:
                 metric = eval.evaluate(transformed_dataset)
                 results.put((metric, self))
-                if task_stack:
-                    queue.put(task_stack.pop(0))
+                if not holding.empty():
+                    queue.put(holding.get())
                 if results.full():
                     queue.stop()
 
-        def get_fit_task(self, queue, results, task_stack=[]):
+        def get_fit_task(self, queue, results, holding=Queue.Queue()):
             self.transformer = self.stage.copy(self.param_map)
-            return partial(self.transform_task, queue, results, task_stack)
+            return partial(self.transform_task, queue, results, holding)
 
-        def get_evaluate_task(self, queue, eval, results, task_stack=[]):
-            return partial(self.evaluate_task, queue, eval, results, task_stack)
+        def get_evaluate_task(self, queue, eval, results, holding=Queue.Queue()):
+            return partial(self.evaluate_task, queue, eval, results, holding)
 
     class EstimatorNode(TransformerNode):
 
-        def fit_task(self, queue, results, task_stack, dataset):
+        def fit_task(self, queue, results, holding, dataset):
             self.transformer = self.stage.fit(dataset, params=self.param_map)
             # The last estimator could only have children that transform, not fit
-            if task_stack:
-                queue.put(task_stack.pop(0))
+            if not holding.empty():
+                queue.put(holding.get())
             results.put(self)
             if results.full():
                 queue.stop()
 
-        def get_fit_task(self, queue, results, task_stack=[]):
-            return partial(self.fit_task, queue, results, task_stack)
+        def get_fit_task(self, queue, results, holding=Queue.Queue()):
+            return partial(self.fit_task, queue, results, holding)
 
     class FeatureExtractionEstimatorNode(EstimatorNode):
 
-        def fit_task(self, queue, results, task_stack, dataset):
+        def fit_task(self, queue, results, holding, dataset):
             self.transformer = self.stage.fit(dataset, params=self.param_map)
             transformed_dataset = self.transformer.transform(dataset)
             if self.children:
                 is_caching = self.init_is_caching()
                 for i, child in enumerate(self.children):
-                    task = child.get_fit_task(queue, results, task_stack)
+                    task = child.get_fit_task(queue, results, holding)
                     if is_caching:
                         task = self.get_cache_task(task)
                     if i == 0 or not child.children:
                         queue.put(partial(task, transformed_dataset))
                     else:
-                        task_stack.insert(0, partial(task, transformed_dataset))
+                        holding.put(partial(task, transformed_dataset))
             else:
                 results.put(self)
                 if results.full():
                     queue.stop()
 
-        def get_fit_task(self, queue, results, task_stack=[]):
-            return partial(self.fit_task, queue, results, task_stack)
+        def get_fit_task(self, queue, results, holding=Queue.Queue()):
+            return partial(self.fit_task, queue, results, holding)
 
 
 class IterableQueue(Queue.Queue):
