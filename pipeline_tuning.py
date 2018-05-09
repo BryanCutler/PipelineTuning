@@ -295,8 +295,10 @@ class DagPipeline(Pipeline, HasParallelism):
 
         pool = ThreadPool(processes=min(self.getParallelism(), num_models))
 
+        # Task queue
         queue = IterableQueue()
 
+        # Queue to store results
         results = Queue.Queue(maxsize=num_models)
 
         start = time.time()
@@ -306,7 +308,7 @@ class DagPipeline(Pipeline, HasParallelism):
             task = root.get_fit_task(queue, results)
             queue.put(partial(task, train))
 
-        for result in pool.imap_unordered(lambda f: f(), queue):
+        for _ in pool.imap_unordered(lambda f: f(), queue):
             pass
         #for task in queue:
         #    task()
@@ -314,17 +316,8 @@ class DagPipeline(Pipeline, HasParallelism):
         elapsed = time.time() - start
         print("Time to fit: %s" % elapsed)
 
-        def get_models_from_leaf(leaf):
-            transformers = []
-            curr = leaf
-            while curr is not None:
-                transformers.insert(0, curr.stage)
-                curr = curr.parents[0] if curr.parents else None  # TODO: multiple parents
-            return transformers
-
         # clear results queue
-        while not results.empty():
-            results.get()
+        results = Queue.Queue(maxsize=num_models)
 
         start = time.time()
 
@@ -333,7 +326,7 @@ class DagPipeline(Pipeline, HasParallelism):
             task = root.get_evaluate_task(queue, eval, results)
             queue.put(partial(task, validation))
 
-        for result in pool.imap_unordered(lambda f: f(), queue):
+        for _ in pool.imap_unordered(lambda f: f(), queue):
             pass
         #for task in queue:
         #    task()
@@ -341,13 +334,18 @@ class DagPipeline(Pipeline, HasParallelism):
         elapsed = time.time() - start
         print("Time to eval: %s" % elapsed)
 
-        metrics = []
-        models = {}
+        # Gather metrics and put back in order of original epm list
+        metrics_params = []
         while not results.empty():
-            metric, leaf = results.get()
-            metrics.append(metric)
-            #models[str(leaf)] = get_models_from_leaf(leaf)
-            #print("Model: %s, Metric: %s" % (leaf, metric))
+            metric, node = results.get()
+            model_params = {}
+            while node is not None:
+                model_params.update(node.param_map)
+                node = node.parents[0] if node.parents else None  # TODO: multiple parents
+            metrics_params.append((metric, model_params))
+        orig_order = {str(e): i for e, i in  zip(paramMaps, range(num_models))}
+        metrics_params = sorted(metrics_params, key=lambda mp: orig_order[str(mp[1])])
+        metrics = [metric for metric, model_params in metrics_params]
 
         return metrics
 
