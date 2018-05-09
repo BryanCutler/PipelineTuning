@@ -414,7 +414,7 @@ class DagPipeline(Pipeline, HasParallelism):
                 new_nodes = [Node(stage, stage_inputs, {})]
 
             # Find parent stage, assume stages in topological order
-            parent_stages = [output_to_stage[i] for i in stage_inputs if i in output_to_stage]
+            parent_stages = set(output_to_stage[i] for i in stage_inputs if i in output_to_stage)
 
             # Make nodes for each node of parent stages
             if parent_stages:
@@ -424,6 +424,7 @@ class DagPipeline(Pipeline, HasParallelism):
                 for parent_nodes in parent_nodes_prod:
                     for node in new_nodes:
                         child_node = copy.copy(node)
+                        child_node.children = []
                         child_node.parents = parent_nodes
                         for parent_node in parent_nodes:
                             parent_node.children.append(child_node)
@@ -443,8 +444,11 @@ class DagPipeline(Pipeline, HasParallelism):
         try:
             import networkx as nx
 
-            if nodes is None and self.nodes is None:
-                raise RuntimeError("Must pass in Nodes or evaluate pipeline first")
+            if nodes is None:
+                if self.nodes is None:
+                    raise RuntimeError("Must pass in Nodes or evaluate pipeline first")
+                else:
+                    nodes = self.nodes
 
             g = nx.DiGraph()
             for node in nodes:
