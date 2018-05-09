@@ -89,7 +89,11 @@ class BFSTree(object):
                 task = child.get_fit_task(queue, results)
                 if is_caching:
                     task = self.get_cache_task(task)
-                queue.put(partial(task, transformed_dataset))
+                # Only queue dataset actions
+                if not isinstance(child, self.tree_type.EstimatorNode):
+                    task(transformed_dataset)
+                else:
+                    queue.put(partial(task, transformed_dataset))
 
         def evaluate_task(self, queue, eval, results, dataset):
             transformed_dataset = self.transformer.transform(dataset)
@@ -99,7 +103,11 @@ class BFSTree(object):
                     task = child.get_evaluate_task(queue, eval, results)
                     if is_caching:
                         task = self.get_cache_task(task)
-                    queue.put(partial(task, transformed_dataset))
+                    # Only queue leaf nodes that evaluate
+                    if child.children:
+                        task(transformed_dataset)
+                    else:
+                        queue.put(partial(task, transformed_dataset))
             else:
                 metric = eval.evaluate(transformed_dataset)
                 results.put((metric, self))
@@ -136,7 +144,11 @@ class BFSTree(object):
                     task = child.get_fit_task(queue, results)
                     if is_caching:
                         task = self.get_cache_task(task)
-                    queue.put(partial(task, transformed_dataset))
+                    # Only queue dataset actions
+                    if not isinstance(child, self.tree_type.EstimatorNode):
+                        task(transformed_dataset)
+                    else:
+                        queue.put(partial(task, transformed_dataset))
             else:
                 results.put(self)
                 if results.full():
