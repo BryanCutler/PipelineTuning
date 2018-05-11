@@ -1,8 +1,10 @@
-# Optimized Spark Python Cross-Validation for Pipelines
+# Spark Python Cross-Validation Optimized for Pipelines
 
 ## Description
 
 This module is an experimental drop-in replacement for the current Spark Python CrossValidator. It optimizes pipeline model selection over a parameter grid by eliminating duplicated work done when fitting and evaluating pipeline stages, while still allowing for the existing model parallelism set by the `parallelism` parameter. This is done by examining each stage of the pipeline along with the given parameter grid and building a Directed Acyclic Graph (DAG) where each node represents a model and/or transformer of a stage with a particular set of parameters. A path in the DAG is equivalent to a `PipelineModel`. Additionaly, nodes in the DAG can cache a DataFrame to allow all child nodes to reuse the parent transforms.  This is currently done in the parent node of the last estimator in the pipeline, which is usually the predictor stage that has the largest parameter grid and can benefit the most by cached input.
+
+NOTE - This is an experimental module and is not production ready.
 
 ## Usage
 
@@ -32,3 +34,4 @@ crossval = DagCrossValidator(estimator=pipeline,
 cvModel = crossval.fit(training)
 cvModel.transform(test).show()
 ```
+
