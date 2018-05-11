@@ -33,6 +33,222 @@ from pyspark.sql.functions import rand
 __all__ = ['DagCrossValidator', 'DagPipeline']
 
 
+def get_param_map_str(param_map):
+    return str({p.name: v for p, v in param_map.iteritems()})
+
+
+class DagPipeline(Pipeline, HasParallelism):
+    """
+    Perform optimized model selection for a pipline with a parameter grid. This examines the
+    parameters for each stage and builds an execution graph to eliminate duplicated work and
+    cache intermediate results to be reused. Tasks are run in a threadpool that has a size of
+    `parallelism`.
+    """
+
+    def __init__(self, stages, parallelism, tree_type="bfs"):
+        super(DagPipeline, self).__init__(stages=stages)
+        self.setParallelism(parallelism)
+        self.roots = None
+        self.nodes = None
+        self.tree_type = tree_type
+
+    def evaluate(self, paramMaps, train, validation, eval):
+        num_models = len(paramMaps)
+
+        # Build a DAG from the stages
+        self.roots, self.nodes = self.build_dag(paramMaps)
+
+        # Run tasks in queue using thread pool
+        pool = ThreadPool(processes=min(self.getParallelism(), num_models))
+        queue = IterableQueue()
+
+        # Queue to store results
+        results = Queue.Queue(maxsize=num_models)
+
+        # Fit the pipeline models
+        for root in self.roots:
+            task = root.get_fit_task(queue, results)
+            queue.put(partial(task, train))
+
+        # Run the fit tasks
+        for _ in pool.imap_unordered(lambda f: f(), queue):
+            pass
+
+        # clear results queue
+        results = Queue.Queue(maxsize=num_models)
+
+        # Evaluate the modesl
+        for root in self.roots:
+            task = root.get_evaluate_task(queue, eval, results)
+            queue.put(partial(task, validation))
+
+        # Run evaluate tasks
+        for _ in pool.imap_unordered(lambda f: f(), queue):
+            pass
+
+        # Gather metrics and put back in order of original epm list
+        metrics_params = []
+        while not results.empty():
+            metric, node = results.get()
+            model_params = {}
+            while node is not None:
+                model_params.update(node.param_map)
+                node = node.parent
+            metrics_params.append((metric, model_params))
+        orig_order = {get_param_map_str(p): i for p, i in  zip(paramMaps, range(num_models))}
+        metrics_params = sorted(metrics_params, key=lambda mp: orig_order[get_param_map_str(mp[1])])
+        metrics = [metric for metric, model_params in metrics_params]
+
+        return metrics
+
+    def build_dag(self, paramMaps):
+
+        # Type of tree search to execute dag
+        tree = BFSTree if self.tree_type.lower() == "bfs" else DFSTree
+
+        stages = self.getStages()
+        stage_prev = None
+
+        # Locate the last estimator, will not transform training data after fit
+        for i, stage in enumerate(stages):
+            if isinstance(stage, Estimator):
+                last_est_index = i
+
+        nodes = []
+        roots = []
+        stage_nodes = {}
+        for i, stage in enumerate(stages):
+
+            # Determine what type of Node for the stage
+            if isinstance(stage, Estimator):
+                if i < last_est_index:
+                    Node = tree.FeatureExtractionEstimatorNode
+                else:
+                    Node = tree.EstimatorNode
+            else:
+                Node = tree.TransformerNode
+
+            # Separate ParamMaps for the stage
+            temp_map = {}
+            for param_map in paramMaps:
+                for k, v in param_map.iteritems():
+                    if k.parent == stage.uid:
+                        temp_map.setdefault(k, set()).add(v)
+
+            # Check if have a param grid for this stage
+            if temp_map:
+                grid_builder = ParamGridBuilder()
+                for k, v in temp_map.iteritems():
+                    grid_builder.addGrid(k, v)
+                stage_param_grid = grid_builder.build()
+                new_nodes = [Node(stage, param_map) for param_map in stage_param_grid]
+            else:
+                new_nodes = [Node(stage, {})]
+
+            # Make nodes for each node of parent stage
+            if stage_prev:
+                temp_nodes = []
+                parent_nodes = stage_nodes[stage_prev]
+                for parent_node in parent_nodes:
+                    for node in new_nodes:
+                        child_node = copy.copy(node)
+                        child_node.children = []
+                        child_node.parent = parent_node
+                        parent_node.children.append(child_node)
+                        temp_nodes.append(child_node)
+                new_nodes = temp_nodes
+            else:
+                roots += new_nodes
+
+            # Store all new nodes created for this stage
+            stage_nodes[stage] = new_nodes
+            nodes += new_nodes
+
+            stage_prev = stage
+
+        return roots, nodes
+
+    def get_graph(self, nodes=None, draw=False):
+        try:
+            import networkx as nx
+
+            if nodes is None:
+                if self.nodes is None:
+                    raise RuntimeError("Must pass in Nodes or evaluate pipeline first")
+                else:
+                    nodes = self.nodes
+
+            g = nx.DiGraph()
+            for node in nodes:
+                if node.parent is not None:
+                    g.add_edge(node.parent, node)
+            if draw:
+                nx.draw(g, with_labels=True)
+
+            return g
+        except ImportError as e:
+            raise ImportError("Must install networkx to build graph\n%s" % e)
+
+
+class DagCrossValidator(CrossValidator):
+    """
+    If the given estimator is a pipeline, it will be wrapped as a `DagPipeline` for tuning,
+    otherwise standard pyspark.ml cross-validation will be done. A `DagPipeline` will
+    perform optimized model selection for a pipline with a parameter grid. This examines the
+    parameters for each stage and builds an execution graph to eliminate duplicated work and
+    cache intermediate results to be reused. Tasks are run in a threadpool that has a size of
+    `parallelism`.
+    """
+
+    def _fit(self, dataset):
+        current_estimator = self.getEstimator()
+
+        # Not a Pipeline, use standard CrossValidator
+        if not isinstance(current_estimator, Pipeline):
+            return super(DagCrossValidator, self)._fit(dataset)
+        # Delegate parallelism to DagPipeline
+        elif not isinstance(current_estimator, DagPipeline):
+            dag_pipeline = DagPipeline(stages=current_estimator.getStages(),
+                                       parallelism=self.getParallelism())
+        # Already a DagPipeline
+        else:
+            dag_pipeline = current_estimator
+
+        epm = self.getOrDefault(self.estimatorParamMaps)
+        numModels = len(epm)
+        eva = self.getOrDefault(self.evaluator)
+        nFolds = self.getOrDefault(self.numFolds)
+        seed = self.getOrDefault(self.seed)
+        h = 1.0 / nFolds
+        randCol = self.uid + "_rand"
+        df = dataset.select("*", rand(seed).alias(randCol))
+        metrics = [0.0] * numModels
+
+        for i in range(nFolds):
+            validateLB = i * h
+            validateUB = (i + 1) * h
+            condition = (df[randCol] >= validateLB) & (df[randCol] < validateUB)
+            validation = df.filter(condition).cache()
+            train = df.filter(~condition).cache()
+
+            fold_metrics = dag_pipeline.evaluate(epm, train, validation, eva)
+
+            for j in range(len(metrics)):
+                metrics[j] += fold_metrics[j] / nFolds
+
+            validation.unpersist()
+            train.unpersist()
+
+        if eva.isLargerBetter():
+            bestIndex = np.argmax(metrics)
+        else:
+            bestIndex = np.argmin(metrics)
+
+        bestModel = current_estimator.fit(dataset, epm[bestIndex])
+
+        return self._copyValues(CrossValidatorModel(bestModel, metrics))
+
+
 class PipelineTreeNode(object):
 
     def __init__(self, stage, param_map, tree_type):
@@ -46,9 +262,8 @@ class PipelineTreeNode(object):
         self.tree_type = tree_type
 
     def __repr__(self):
-        param_map_str = str({p.name: v for p, v in self.param_map.iteritems()})
-        parent_map_str = str([{} if self.parent is None else
-                              {p.name: v for p, v in self.parent.param_map.iteritems()}])
+        param_map_str = get_param_map_str(self.param_map)
+        parent_map_str = "" if self.parent is None else get_param_map_str(self.parent.param_map)
         return self.stage.uid + param_map_str + parent_map_str
 
     def cache_task(self, task, dataset):
@@ -257,214 +472,3 @@ class IterableQueue(Queue.Queue):
 
     def stop(self):
         self.put(self._sentinel)
-
-
-class DagPipeline(Pipeline, HasParallelism):
-
-    def __init__(self, stages, parallelism, tree_type="bfs"):
-        super(DagPipeline, self).__init__(stages=stages)
-        self.setParallelism(parallelism)
-        self.roots = None
-        self.nodes = None
-        self.tree_type = tree_type
-
-    def evaluate(self, paramMaps, train, validation, eval):
-        num_models = len(paramMaps)
-        print('Num Models: %d, Parallelism: %d' % (num_models, self.getParallelism()))
-
-        # Build a DAG from the stages
-        self.roots, self.nodes = self.build_dag(paramMaps)
-
-        # Run tasks in queue using thread pool
-        pool = ThreadPool(processes=min(self.getParallelism(), num_models))
-        queue = IterableQueue()
-
-        # Queue to store results
-        results = Queue.Queue(maxsize=num_models)
-
-        start = time.time()
-
-        # Fit the pipeline models
-        for root in self.roots:
-            task = root.get_fit_task(queue, results)
-            queue.put(partial(task, train))
-
-        for _ in pool.imap_unordered(lambda f: f(), queue):
-            pass
-        #for task in queue:
-        #    task()
-
-        elapsed = time.time() - start
-        print("Time to fit: %s" % elapsed)
-
-        # clear results queue
-        results = Queue.Queue(maxsize=num_models)
-
-        start = time.time()
-
-        # Evaluate the modesl
-        for root in self.roots:
-            task = root.get_evaluate_task(queue, eval, results)
-            queue.put(partial(task, validation))
-
-        for _ in pool.imap_unordered(lambda f: f(), queue):
-            pass
-        #for task in queue:
-        #    task()
-
-        elapsed = time.time() - start
-        print("Time to eval: %s" % elapsed)
-
-        # Gather metrics and put back in order of original epm list
-        metrics_params = []
-        while not results.empty():
-            metric, node = results.get()
-            model_params = {}
-            while node is not None:
-                model_params.update(node.param_map)
-                node = node.parent
-            metrics_params.append((metric, model_params))
-        orig_order = {str(e): i for e, i in  zip(paramMaps, range(num_models))}
-        metrics_params = sorted(metrics_params, key=lambda mp: orig_order[str(mp[1])])
-        metrics = [metric for metric, model_params in metrics_params]
-
-        return metrics
-
-    def build_dag(self, paramMaps):
-
-        # Type of tree search to execute dag
-        tree = BFSTree if self.tree_type.lower() == "bfs" else DFSTree
-
-        stages = self.getStages()
-        stage_prev = None
-
-        # Locate the last estimator, will not transform training data after fit
-        for i, stage in enumerate(stages):
-            if isinstance(stage, Estimator):
-                last_est_index = i
-
-        nodes = []
-        roots = []
-        stage_nodes = {}
-        for i, stage in enumerate(stages):
-
-            # Determine what type of Node for the stage
-            if isinstance(stage, Estimator):
-                if i < last_est_index:
-                    Node = tree.FeatureExtractionEstimatorNode
-                else:
-                    Node = tree.EstimatorNode
-            else:
-                Node = tree.TransformerNode
-
-            # Separate ParamMaps for the stage
-            temp_map = {}
-            for param_map in paramMaps:
-                for k, v in param_map.iteritems():
-                    if k.parent == stage.uid:
-                        temp_map.setdefault(k, set()).add(v)
-
-            # Check if have a param grid for this stage
-            if temp_map:
-                grid_builder = ParamGridBuilder()
-                for k, v in temp_map.iteritems():
-                    grid_builder.addGrid(k, v)
-                stage_param_grid = grid_builder.build()
-                new_nodes = [Node(stage, param_map) for param_map in stage_param_grid]
-            else:
-                new_nodes = [Node(stage, {})]
-
-            # Make nodes for each node of parent stage
-            if stage_prev:
-                temp_nodes = []
-                parent_nodes = stage_nodes[stage_prev]
-                for parent_node in parent_nodes:
-                    for node in new_nodes:
-                        child_node = copy.copy(node)
-                        child_node.children = []
-                        child_node.parent = parent_node
-                        parent_node.children.append(child_node)
-                        temp_nodes.append(child_node)
-                new_nodes = temp_nodes
-            else:
-                roots += new_nodes
-
-            # Store all new nodes created for this stage
-            stage_nodes[stage] = new_nodes
-            nodes += new_nodes
-
-            stage_prev = stage
-
-        return roots, nodes
-
-    def get_graph(self, nodes=None, draw=False):
-        try:
-            import networkx as nx
-
-            if nodes is None:
-                if self.nodes is None:
-                    raise RuntimeError("Must pass in Nodes or evaluate pipeline first")
-                else:
-                    nodes = self.nodes
-
-            g = nx.DiGraph()
-            for node in nodes:
-                if node.parent is not None:
-                    g.add_edge(node.parent, node)
-            if draw:
-                nx.draw(g, with_labels=True)
-
-            return g
-        except ImportError as e:
-            raise ImportError("Must install networkx to build graph\n%s" % e)
-
-
-class DagCrossValidator(CrossValidator):
-
-    def _fit(self, dataset):
-        current_estimator = self.getEstimator()
-
-        # Not a Pipeline, use standard CrossValidator
-        if not isinstance(current_estimator, Pipeline):
-            return super(DagCrossValidator, self)._fit(dataset)
-        # Delegate parallelism to DagPipeline
-        elif not isinstance(current_estimator, DagPipeline):
-            dag_pipeline = DagPipeline(stages=current_estimator.getStages(),
-                                       parallelism=self.getParallelism())
-        # Already a DagPipeline
-        else:
-            dag_pipeline = current_estimator
-
-        epm = self.getOrDefault(self.estimatorParamMaps)
-        numModels = len(epm)
-        eva = self.getOrDefault(self.evaluator)
-        nFolds = self.getOrDefault(self.numFolds)
-        seed = self.getOrDefault(self.seed)
-        h = 1.0 / nFolds
-        randCol = self.uid + "_rand"
-        df = dataset.select("*", rand(seed).alias(randCol))
-        metrics = [0.0] * numModels
-
-        for i in range(nFolds):
-            validateLB = i * h
-            validateUB = (i + 1) * h
-            condition = (df[randCol] >= validateLB) & (df[randCol] < validateUB)
-            validation = df.filter(condition).cache()
-            train = df.filter(~condition).cache()
-
-            fold_metrics = dag_pipeline.evaluate(epm, train, validation, eva)
-
-            for j in range(len(metrics)):
-                metrics[j] += fold_metrics[j] / nFolds
-
-            validation.unpersist()
-            train.unpersist()
-
-        if eva.isLargerBetter():
-            bestIndex = np.argmax(metrics)
-        else:
-            bestIndex = np.argmin(metrics)
-
-        bestModel = current_estimator.fit(dataset, epm[bestIndex])
-
-        return self._copyValues(CrossValidatorModel(bestModel, metrics))
